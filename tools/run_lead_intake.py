@@ -36,6 +36,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders as email_encoders
+import email.utils
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from googleapiclient.errors import HttpError
 
@@ -94,7 +96,7 @@ CRM_HEADERS = [
     "Email", "Phone", "Event Date", "Day of Week", "Day Type",
     "Start Time", "End Time", "Duration (hrs)", "Estimated Attendance",
     "Est. Price (2hr)", "Est. Price (4hr)", "# of Pizzas",
-    "Event Details", "Status", "Notes", "Gmail Message ID", "Reply Sent",
+    "Event Details", "Status", "Notes", "Gmail Message ID", "Reply Sent", "Follow-up Sent",
 ]
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -250,11 +252,12 @@ def parse_lead(msg_id, message):
 
     location = next((v for k, v in SUBJECT_MAP.items() if k.lower() in subject.lower()), "Unknown")
 
-    # Parse date received — split into date (mm/dd/yyyy) and time (HH:MM) columns
+    # Parse date received — convert to Eastern time, split into date and time columns
     try:
-        date_received = datetime.datetime.strptime(raw_date[:25].strip(), "%a, %d %b %Y %H:%M:%S")
-        date_received_date = date_received.strftime("%m/%d/%Y")
-        date_received_time = to_12hr(date_received.strftime("%H:%M"))
+        dt = email.utils.parsedate_to_datetime(raw_date)
+        dt_eastern = dt.astimezone(ZoneInfo("America/New_York"))
+        date_received_date = dt_eastern.strftime("%m/%d/%Y")
+        date_received_time = to_12hr(dt_eastern.strftime("%H:%M"))
     except Exception:
         date_received_date = raw_date
         date_received_time = ""
@@ -303,7 +306,9 @@ def parse_lead(msg_id, message):
         "day_of_week":         day_of_week,
         "day_type":            day_type,
         "start_time":          start_time,
+        "start_time_raw":      start_time_raw,  # HH:MM, used for hours/calendar checks
         "end_time":            end_time,
+        "end_time_raw":        end_time_raw,    # HH:MM, used for hours/calendar checks
         "duration":            duration,
         "attendance":          attendance,
         "price_2hr":           price_2hr,
@@ -442,6 +447,7 @@ def append_lead(sheets, lead, lead_id):
         "",           # Notes (blank)
         lead["msg_id"],
         "",           # Reply Sent — populated after email is sent successfully
+        "",           # Follow-up Sent — populated after follow-up is sent
     ]
 
     sheets.spreadsheets().values().append(
@@ -467,25 +473,59 @@ def mark_reply_sent(sheets, lead_id):
 
 # ── Calendar ──────────────────────────────────────────────────────────────────
 
-def check_calendar(creds, location, event_date_raw):
-    """Check if the location's Google Calendar has any events on the given date.
+def _within_two_hours(calendar_event, req_start_raw, req_end_raw, event_date_raw):
+    """Returns True if requested time overlaps or is within 2 hours of the calendar event."""
+    try:
+        evt_start_str = calendar_event.get("start", {}).get("dateTime", "")
+        evt_end_str   = calendar_event.get("end",   {}).get("dateTime", "")
+        if not evt_start_str or not evt_end_str or not req_start_raw or not req_end_raw:
+            return True  # fail closed — treat as conflict if times can't be parsed
 
-    Returns True if a conflict is found, False if clear or if the check fails.
-    event_date_raw must be in YYYY-MM-DD format.
-    Fails open — a calendar API error never blocks the reply from sending.
+        # Extract HH:MM from ISO dateTime strings (e.g. "2026-04-21T18:00:00-04:00")
+        evt_start_hm = evt_start_str.split("T")[1][:5]
+        evt_end_hm   = evt_end_str.split("T")[1][:5]
+
+        fmt  = "%H:%M"
+        date = datetime.datetime.strptime(event_date_raw.strip(), "%Y-%m-%d").date()
+
+        def to_dt(hm):
+            return datetime.datetime.combine(date, datetime.datetime.strptime(hm, fmt).time())
+
+        req_start = to_dt(req_start_raw)
+        req_end   = to_dt(req_end_raw)
+        evt_start = to_dt(evt_start_hm)
+        evt_end   = to_dt(evt_end_hm)
+        two_hours = datetime.timedelta(hours=2)
+
+        return (
+            abs(req_start - evt_start) < two_hours or
+            abs(req_start - evt_end)   < two_hours or
+            abs(req_end   - evt_start) < two_hours or
+            abs(req_end   - evt_end)   < two_hours
+        )
+    except Exception:
+        return True  # fail closed
+
+
+def check_calendar(creds, location, event_date_raw, start_time_raw="", end_time_raw=""):
+    """Check Google Calendar for booking conflicts on the requested date.
+
+    Returns 'private_booked', 'booked', or 'clear'.
+    - private_booked: a 'Private Reservation' event exists — date fully blocked.
+    - booked: a 'Reservation' event exists and requested time is within 2 hours of it.
+    - clear: no conflict found, or check failed (fails open).
     """
     cal_id = LP_CALENDAR_ID if location == "Locust Point" else TIM_CALENDAR_ID
     if not cal_id:
         print(f"  Calendar ID not configured for {location} — skipping conflict check.")
-        return False
+        return "clear"
 
     if not event_date_raw:
-        return False
+        return "clear"
 
     try:
         calendar = build("calendar", "v3", credentials=creds)
         date = datetime.datetime.strptime(event_date_raw.strip(), "%Y-%m-%d")
-        # Use Eastern time bounds (UTC-5) to capture the full local calendar day
         time_min = date.strftime("%Y-%m-%dT00:00:00-05:00")
         time_max = (date + datetime.timedelta(days=1)).strftime("%Y-%m-%dT00:00:00-05:00")
 
@@ -496,110 +536,125 @@ def check_calendar(creds, location, event_date_raw):
             singleEvents=True,
         ).execute()
 
-        events = result.get("items", [])
-        if events:
-            print(f"  Calendar conflict: {len(events)} event(s) found at {location} on {event_date_raw}.")
-            return True
-        return False
+        for event in result.get("items", []):
+            title = event.get("summary", "").lower()
+            if "private reservation" in title:
+                print(f"  Private Reservation found at {location} on {event_date_raw} — date fully blocked.")
+                return "private_booked"
+            if "reservation" in title:
+                if _within_two_hours(event, start_time_raw, end_time_raw, event_date_raw):
+                    print(f"  Reservation conflict (within 2hr buffer) at {location} on {event_date_raw}.")
+                    return "booked"
+
+        return "clear"
 
     except Exception as e:
         print(f"  Calendar check failed for {location}: {e}. Proceeding without conflict flag.")
-        return False
+        return "clear"
 
 # ── Email Reply ───────────────────────────────────────────────────────────────
 
-def _build_email_body(lead, has_conflict):
-    """Return the plain-text email body for a standard or conflict reply."""
-    first_name  = lead["first_name"] or "there"
-    location    = lead["location"]
-    event_date  = lead["event_date"]
-    day_of_week = lead["day_of_week"]
-    attendance  = lead["attendance"]
-    price_2hr   = lead["price_2hr"]
-    duration    = lead["duration"]
-    day_type    = lead["day_type"]
+HOURS_OF_OPERATION = {
+    "Tuesday":   ("16:00", "21:00"),
+    "Wednesday": ("16:00", "21:00"),
+    "Thursday":  ("16:00", "21:00"),
+    "Friday":    ("14:00", "22:00"),
+    "Saturday":  ("12:00", "22:00"),
+    "Sunday":    ("12:00", "20:00"),
+}
 
-    # Pricing note for custom/Monday events
-    if str(price_2hr).startswith("Custom"):
-        pricing_line = (
-            "Based on your event details, pricing will need to be worked out on an individual "
-            "basis — we'll follow up with a custom quote."
-        )
-    else:
-        pricing_line = f"Based on your guest count, your estimated 2-hour event fee would be {price_2hr}."
 
-    if has_conflict:
-        body = f"""\
-Hi {first_name},
+def _is_outside_hours(day_of_week, start_time_raw, end_time_raw):
+    """Returns True if the event falls outside normal hours of operation."""
+    if day_of_week == "Monday":
+        return True
+    if day_of_week not in HOURS_OF_OPERATION:
+        return False
+    open_str, close_str = HOURS_OF_OPERATION[day_of_week]
+    try:
+        fmt     = "%H:%M"
+        start   = datetime.datetime.strptime(start_time_raw, fmt).time()
+        end     = datetime.datetime.strptime(end_time_raw,   fmt).time()
+        open_t  = datetime.datetime.strptime(open_str,       fmt).time()
+        close_t = datetime.datetime.strptime(close_str,      fmt).time()
+        return start < open_t or end > close_t
+    except Exception:
+        return False
 
-Thank you for reaching out! We appreciate your interest in hosting your event with us at Diamondback Brewing Co.
 
-We wanted to flag that {event_date} may already be spoken for at our {location} location. If you have any flexibility on dates, we'd love to find something that works — just reply with a few alternatives and we'll check availability for you.
+def _select_template(lead, calendar_status):
+    """Return the template filename for this lead based on routing rules."""
+    prefix = "lp" if lead["location"] == "Locust Point" else "tim"
 
-In the meantime, here's a quick pricing overview based on what you shared:
+    # 1. Calendar conflict takes top priority
+    if calendar_status in ("private_booked", "booked"):
+        return f"{prefix}_date_booked.txt"
 
-  Estimated Guests: {attendance}
-  {pricing_line}
+    # 2. >60 guests → private buyout
+    try:
+        if int(str(lead["attendance"]).strip()) > 60:
+            return f"{prefix}_private_buyout.txt"
+    except (ValueError, TypeError):
+        pass
 
-We've attached our current pricing sheet for your reference.
+    # 3. Monday or outside hours → custom pricing
+    if _is_outside_hours(lead["day_of_week"], lead.get("start_time_raw", ""), lead.get("end_time_raw", "")):
+        return f"{prefix}_custom_pricing.txt"
 
-Looking forward to making it work!
+    # 4. Default — standard
+    return f"{prefix}_standard.txt"
 
-Diamondback Brewing Co
-{REPLY_FROM}
-"""
-    else:
-        body = f"""\
-Hi {first_name},
 
-Thank you for reaching out to Diamondback Brewing Co! We'd love to help make your event special.
+def _load_template(template_name, lead):
+    """Load a template file, substitute placeholders, and return (subject, body)."""
+    template_path = Path("templates") / template_name
+    with open(template_path, "r") as f:
+        content = f.read()
 
-Here's a quick overview based on what you shared:
+    lines = content.split("\n")
+    subject = lines[0].replace("SUBJECT: ", "").strip()
+    body    = "\n".join(lines[2:])  # skip subject line and --- separator
 
-  Event Date:          {day_of_week}, {event_date}
-  Estimated Guests:    {attendance}
-  Estimated Duration:  {duration} hours
+    replacements = {
+        "[FIRST_NAME]":  lead["first_name"] or "there",
+        "[EVENT_DATE]":  lead["event_date"],
+        "[DAY_OF_WEEK]": lead["day_of_week"],
+        "[GUEST_COUNT]": str(lead["attendance"]),
+        "[START_TIME]":  lead["start_time"],
+        "[END_TIME]":    lead["end_time"],
+        "[PRICE_2HR]":   str(lead["price_2hr"]),
+    }
+    for placeholder, value in replacements.items():
+        subject = subject.replace(placeholder, value)
+        body    = body.replace(placeholder, value)
 
-{pricing_line}
-
-We've attached our current pricing sheet for your reference.
-
-To move forward or ask any questions, just reply to this email and we'll get you scheduled.
-
-We look forward to hearing from you!
-
-Diamondback Brewing Co
-{REPLY_FROM}
-"""
-    return body
+    return subject, body
 
 
 def send_reply(main_creds, send_creds, lead):
-    """Compose and send a reply email with the location pricing PDF attached.
+    """Compose and send a reply email using the appropriate template.
 
     Uses main_creds for the calendar check and send_creds for the Gmail send.
     Returns True on success, False on failure.
     Requires ENABLE_REPLY_SEND=true — caller is responsible for checking the flag.
+    PDF is attached for all templates except custom_pricing.
     """
-    to_email  = lead["email"]
-    location  = lead["location"]
+    to_email = lead["email"]
+    location = lead["location"]
 
     if not to_email:
         print("  No customer email address — cannot send reply.")
         return False
 
-    # Determine which pricing PDF to attach
-    pdf_path = CUSTOMER_PRICING_LP if location == "Locust Point" else CUSTOMER_PRICING_TIM
-    if not os.path.exists(pdf_path):
-        print(f"  Pricing PDF not found at '{pdf_path}' — cannot send reply.")
-        return False
-
     # Calendar conflict check — uses main (info@) credentials
-    has_conflict = check_calendar(main_creds, location, lead.get("event_date_raw", ""))
+    calendar_status = check_calendar(
+        main_creds, location, lead.get("event_date_raw", ""),
+        lead.get("start_time_raw", ""), lead.get("end_time_raw", "")
+    )
 
-    # Compose email
-    subject = f"Re: Your Event Inquiry at Diamondback Brewing Co — {location}"
-    body_text = _build_email_body(lead, has_conflict)
+    # Select and load template
+    template_name = _select_template(lead, calendar_status)
+    subject, body_text = _load_template(template_name, lead)
 
     msg = MIMEMultipart()
     msg["From"]    = REPLY_FROM
@@ -607,15 +662,19 @@ def send_reply(main_creds, send_creds, lead):
     msg["Subject"] = subject
     msg.attach(MIMEText(body_text, "plain"))
 
-    # Attach the pricing PDF
-    with open(pdf_path, "rb") as f:
-        pdf_data = f.read()
-    pdf_part = MIMEBase("application", "octet-stream")
-    pdf_part.set_payload(pdf_data)
-    email_encoders.encode_base64(pdf_part)
-    pdf_filename = os.path.basename(pdf_path)
-    pdf_part.add_header("Content-Disposition", f'attachment; filename="{pdf_filename}"')
-    msg.attach(pdf_part)
+    # Attach pricing PDF — skip for custom_pricing templates
+    if "custom_pricing" not in template_name:
+        pdf_path = CUSTOMER_PRICING_LP if location == "Locust Point" else CUSTOMER_PRICING_TIM
+        if not os.path.exists(pdf_path):
+            print(f"  Pricing PDF not found at '{pdf_path}' — sending without attachment.")
+        else:
+            with open(pdf_path, "rb") as f:
+                pdf_data = f.read()
+            pdf_part = MIMEBase("application", "octet-stream")
+            pdf_part.set_payload(pdf_data)
+            email_encoders.encode_base64(pdf_part)
+            pdf_part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(pdf_path)}"')
+            msg.attach(pdf_part)
 
     # Encode and send via Gmail API — uses send (reservations@) credentials
     raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
@@ -626,8 +685,7 @@ def send_reply(main_creds, send_creds, lead):
             userId="me",
             body={"raw": raw_message},
         ).execute()
-        conflict_note = " (conflict flagged)" if has_conflict else ""
-        print(f"  → Reply sent to {to_email}{conflict_note}")
+        print(f"  → Reply sent to {to_email} [{template_name}]")
         return True
     except Exception as e:
         print(f"  Reply send failed for {to_email}: {e}")
@@ -645,6 +703,104 @@ def save_processed_id(msg_id):
     ids.add(msg_id)
     PROCESSED_FILE.parent.mkdir(exist_ok=True)
     PROCESSED_FILE.write_text(json.dumps(list(ids)))
+
+# ── Follow-up ─────────────────────────────────────────────────────────────────
+
+def _business_days_since(timestamp_str):
+    """Return the number of business days (Mon–Fri) between timestamp_str and today."""
+    try:
+        sent_date = datetime.datetime.strptime(timestamp_str, "%m/%d/%Y %I:%M %p").date()
+        today = datetime.date.today()
+        count = 0
+        current = sent_date + datetime.timedelta(days=1)
+        while current <= today:
+            if current.weekday() < 5:  # 0=Mon, 4=Fri
+                count += 1
+            current += datetime.timedelta(days=1)
+        return count
+    except Exception:
+        return 0
+
+
+def send_followups(sheets, send_creds):
+    """Scan CRM for leads that need a 5-business-day follow-up and send them.
+
+    Eligibility: Reply Sent (col W) is set, Follow-up Sent (col X) is blank,
+    and at least 5 business days have passed since the reply was sent.
+    No PDF attached — follow-up is plain email only.
+    """
+    result = sheets.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"{CRM_TAB}!A:X",
+    ).execute()
+    rows = result.get("values", [])
+    if len(rows) <= 1:
+        return
+
+    followups_sent = 0
+    for i, row in enumerate(rows[1:], start=2):  # row 1 is header; lead rows start at 2
+        while len(row) < 24:
+            row.append("")
+
+        reply_sent    = row[22]  # col W
+        followup_sent = row[23]  # col X
+        email         = row[6]   # col G
+        first_name    = row[4]   # col E
+        location      = row[3]   # col D
+        event_date    = row[8]   # col I
+        day_of_week   = row[9]   # col J
+        start_time    = row[11]  # col L
+        end_time      = row[12]  # col M
+        price_2hr     = row[15]  # col P
+        attendance    = row[14]  # col O
+
+        if not reply_sent or followup_sent or not email:
+            continue
+
+        if _business_days_since(reply_sent) < 5:
+            continue
+
+        template_name = "lp_followup.txt" if location == "Locust Point" else "tim_followup.txt"
+        lead = {
+            "first_name": first_name,
+            "event_date": event_date,
+            "day_of_week": day_of_week,
+            "location": location,
+            "attendance": attendance,
+            "start_time": start_time,
+            "end_time": end_time,
+            "price_2hr": price_2hr,
+        }
+        subject, body_text = _load_template(template_name, lead)
+
+        msg = MIMEMultipart()
+        msg["From"]    = REPLY_FROM
+        msg["To"]      = email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body_text, "plain"))
+
+        raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+        try:
+            gmail_send = build("gmail", "v1", credentials=send_creds)
+            gmail_send.users().messages().send(
+                userId="me",
+                body={"raw": raw_message},
+            ).execute()
+            timestamp = datetime.datetime.now().strftime("%m/%d/%Y %-I:%M %p")
+            sheets.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range=f"{CRM_TAB}!X{i}",
+                valueInputOption="RAW",
+                body={"values": [[timestamp]]},
+            ).execute()
+            print(f"  → Follow-up sent to {email} (lead row {i})")
+            followups_sent += 1
+        except Exception as e:
+            print(f"  Follow-up failed for row {i}: {e}")
+
+    if followups_sent:
+        print(f"  {followups_sent} follow-up(s) sent.")
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -694,6 +850,9 @@ def main():
         added += 1
 
     print(f"Done. {added} new lead(s) added to '{CRM_TAB}' tab.")
+
+    if ENABLE_REPLY_SEND:
+        send_followups(sheets, send_creds)
 
 if __name__ == "__main__":
     main()
