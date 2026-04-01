@@ -1,0 +1,7 @@
+.tmp/
+.env
+credentials.json
+token.json
+token_send.json
+.DS_Store
+.claude/
