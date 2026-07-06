@@ -32,6 +32,8 @@
 
 ### 4-Hour Rates
 
+> **Internal estimate only.** As of the current source PDFs, 4-hour events are quoted as **custom** pricing ("worked out on an individual basis"). The rates below are retained for internal estimating and are **not** shown on the customer-facing PDFs.
+
 | Guests     | Weeknight | Weekend  |
 |------------|-----------|----------|
 | 10 – 20    | $900      | $1,000   |
