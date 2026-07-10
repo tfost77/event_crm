@@ -63,8 +63,8 @@ PROCESSED_FILE   = Path(".tmp/processed_emails.json")
 LP_CALENDAR_ID      = os.getenv("LP_CALENDAR_ID", "")
 TIM_CALENDAR_ID     = os.getenv("TIM_CALENDAR_ID", "")
 REPLY_FROM          = os.getenv("REPLY_FROM", "reservations@diamondbackbeer.com")
-CUSTOMER_PRICING_LP  = os.getenv("CUSTOMER_PRICING_LP",  "docs/Customer Pricing - Locust Point.pdf")
-CUSTOMER_PRICING_TIM = os.getenv("CUSTOMER_PRICING_TIM", "docs/Customer Pricing - TIMONIUM.pdf")
+CUSTOMER_PRICING_LP  = os.getenv("CUSTOMER_PRICING_LP",  "docs/Reservation Pricing - Locust Point.pdf")
+CUSTOMER_PRICING_TIM = os.getenv("CUSTOMER_PRICING_TIM", "docs/Reservation Pricing - TIMONIUM.pdf")
 ENABLE_REPLY_SEND   = os.getenv("ENABLE_REPLY_SEND", "false").lower() == "true"
 
 # info@diamondbackbeer.com — reads leads, writes to Sheets, checks Calendar
@@ -74,14 +74,17 @@ MAIN_SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
 ]
 
-# reservations@diamondbackbeer.com — sends replies only
+# reservations@diamondbackbeer.com — sends replies and reads inbox for customer reply detection
 SEND_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
 SUBJECT_MAP = {
     "New form submission for Timonium Form 2":     "Timonium",
+    "New form submission for Timonium Form 1":     "Timonium",
     "New form submission for Locust Point Form 2": "Locust Point",
+    "New form submission for Locust Point Form 1": "Locust Point",
 }
 
 # 2-hour pricing tables (both locations use the same rates)
@@ -253,18 +256,19 @@ def parse_lead(msg_id, message):
     location = next((v for k, v in SUBJECT_MAP.items() if k.lower() in subject.lower()), "Unknown")
 
     # Parse date received — convert to Eastern time, split into date and time columns
+    date_received_date = ""
+    date_received_time = ""
     try:
         dt = email.utils.parsedate_to_datetime(raw_date)
         dt_eastern = dt.astimezone(ZoneInfo("America/New_York"))
         date_received_date = dt_eastern.strftime("%m/%d/%Y")
-        date_received_time = to_12hr(dt_eastern.strftime("%H:%M"))
+        date_received_time = dt_eastern.strftime("%-I:%M %p")  # e.g. "2:15 PM"
     except Exception:
-        date_received_date = raw_date
-        date_received_time = ""
+        pass  # leave blank rather than dump raw header string into sheet
 
     first_name   = parse_field(body, "First Name")
     last_name    = parse_field(body, "Last Name")
-    email        = parse_field(body, "Email Address")
+    email_addr   = parse_field(body, "Email Address")
     phone        = parse_field(body, "Phone Number")
     event_date_raw = parse_field(body, "Field 5")  # YYYY-MM-DD from Webflow
     try:
@@ -299,7 +303,7 @@ def parse_lead(msg_id, message):
         "location":            location,
         "first_name":          first_name,
         "last_name":           last_name,
-        "email":               email,
+        "email":               email_addr,
         "phone":               phone,
         "event_date":          event_date,
         "event_date_raw":      event_date_raw,  # YYYY-MM-DD, used for calendar check
@@ -318,10 +322,20 @@ def parse_lead(msg_id, message):
     }
 
 def to_12hr(time_str):
-    """Convert HH:MM (24hr) to h:MM AM/PM. Returns original string if parsing fails."""
+    """Convert a time string to h:MM AM/PM. Tries multiple input formats."""
+    if not time_str:
+        return time_str
+    s = time_str.strip()
+    for fmt in ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p"):
+        try:
+            t = datetime.datetime.strptime(s, fmt)
+            return t.strftime("%-I:%M %p")  # e.g. "6:00 PM"
+        except ValueError:
+            continue
+    # Last resort: try case-insensitive AM/PM
     try:
-        t = datetime.datetime.strptime(time_str.strip(), "%H:%M")
-        return t.strftime("%-I:%M %p")  # e.g. "6:00 PM"
+        t = datetime.datetime.strptime(s.upper(), "%I:%M %p")
+        return t.strftime("%-I:%M %p")
     except Exception:
         return time_str
 
@@ -356,8 +370,8 @@ def calculate_pricing(attendance, day_type, duration):
     if attendance <= 0 or day_type in ("Unknown", "Monday"):
         return "Custom", "Custom", "—"
 
-    if attendance > 60:
-        return "Custom (>60 guests)", "Custom (>60 guests)", "—"
+    if attendance >= 60:
+        return "Custom (≥60 guests)", "Custom (≥60 guests)", "—"
 
     bracket_idx = None
     for i, (low, high) in enumerate(GUEST_BRACKETS):
@@ -591,8 +605,12 @@ def _select_template(lead, calendar_status):
         return f"{prefix}_date_booked.txt"
 
     # 2. >60 guests → private buyout
+    # Attendance may be a range like "70-90" — use the lower bound so we never
+    # under-route a large party that submitted a range spanning above 60.
     try:
-        if int(str(lead["attendance"]).strip()) > 60:
+        attendance_raw = str(lead["attendance"]).strip()
+        attendance_low = int(attendance_raw.split("-")[0].strip())
+        if attendance_low >= 60:
             return f"{prefix}_private_buyout.txt"
     except (ValueError, TypeError):
         pass
@@ -662,19 +680,18 @@ def send_reply(main_creds, send_creds, lead):
     msg["Subject"] = subject
     msg.attach(MIMEText(body_text, "plain"))
 
-    # Attach pricing PDF — skip for custom_pricing templates
-    if "custom_pricing" not in template_name:
-        pdf_path = CUSTOMER_PRICING_LP if location == "Locust Point" else CUSTOMER_PRICING_TIM
-        if not os.path.exists(pdf_path):
-            print(f"  Pricing PDF not found at '{pdf_path}' — sending without attachment.")
-        else:
-            with open(pdf_path, "rb") as f:
-                pdf_data = f.read()
-            pdf_part = MIMEBase("application", "octet-stream")
-            pdf_part.set_payload(pdf_data)
-            email_encoders.encode_base64(pdf_part)
-            pdf_part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(pdf_path)}"')
-            msg.attach(pdf_part)
+    # Attach pricing PDF — sent with all reply templates
+    pdf_path = CUSTOMER_PRICING_LP if location == "Locust Point" else CUSTOMER_PRICING_TIM
+    if not os.path.exists(pdf_path):
+        print(f"  Pricing PDF not found at '{pdf_path}' — sending without attachment.")
+    else:
+        with open(pdf_path, "rb") as f:
+            pdf_data = f.read()
+        pdf_part = MIMEBase("application", "octet-stream")
+        pdf_part.set_payload(pdf_data)
+        email_encoders.encode_base64(pdf_part)
+        pdf_part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(pdf_path)}"')
+        msg.attach(pdf_part)
 
     # Encode and send via Gmail API — uses send (reservations@) credentials
     raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
@@ -722,12 +739,30 @@ def _business_days_since(timestamp_str):
         return 0
 
 
+def customer_has_replied(send_creds, customer_email, reply_sent_str):
+    """Return True if the customer replied to reservations@ after the initial reply was sent."""
+    try:
+        dt = datetime.datetime.strptime(reply_sent_str.strip(), "%m/%d/%Y %I:%M %p")
+        after_date = dt.strftime("%Y/%m/%d")
+    except Exception:
+        return False  # can't parse date — don't suppress follow-up
+
+    try:
+        gmail_send = build("gmail", "v1", credentials=send_creds)
+        query = f"from:{customer_email} after:{after_date}"
+        result = gmail_send.users().messages().list(userId="me", q=query, maxResults=1).execute()
+        return bool(result.get("messages"))
+    except Exception:
+        return False  # fail open — don't suppress follow-up if check errors
+
+
 def send_followups(sheets, send_creds):
     """Scan CRM for leads that need a 5-business-day follow-up and send them.
 
     Eligibility: Reply Sent (col W) is set, Follow-up Sent (col X) is blank,
-    and at least 5 business days have passed since the reply was sent.
-    No PDF attached — follow-up is plain email only.
+    at least 5 business days have passed since the reply was sent,
+    and the customer has not already replied to our email.
+    Includes the location-appropriate pricing PDF attachment.
     """
     result = sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
@@ -760,6 +795,9 @@ def send_followups(sheets, send_creds):
         if _business_days_since(reply_sent) < 5:
             continue
 
+        if customer_has_replied(send_creds, email, reply_sent):
+            continue
+
         template_name = "lp_followup.txt" if location == "Locust Point" else "tim_followup.txt"
         lead = {
             "first_name": first_name,
@@ -778,6 +816,18 @@ def send_followups(sheets, send_creds):
         msg["To"]      = email
         msg["Subject"] = subject
         msg.attach(MIMEText(body_text, "plain"))
+
+        pdf_path = CUSTOMER_PRICING_LP if location == "Locust Point" else CUSTOMER_PRICING_TIM
+        if not os.path.exists(pdf_path):
+            print(f"  Pricing PDF not found at '{pdf_path}' — sending follow-up without attachment.")
+        else:
+            with open(pdf_path, "rb") as f:
+                pdf_data = f.read()
+            pdf_part = MIMEBase("application", "octet-stream")
+            pdf_part.set_payload(pdf_data)
+            email_encoders.encode_base64(pdf_part)
+            pdf_part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(pdf_path)}"')
+            msg.attach(pdf_part)
 
         raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
         try:
@@ -840,9 +890,12 @@ def main():
         append_lead(sheets, lead, next_id)
 
         if ENABLE_REPLY_SEND:
-            reply_sent = send_reply(creds, send_creds, lead)
-            if reply_sent:
-                mark_reply_sent(sheets, next_id)
+            if not lead.get("event_date_raw"):
+                print(f"  Skipping reply for {lead['first_name']} {lead['last_name']} — no event date (likely spam).")
+            else:
+                reply_sent = send_reply(creds, send_creds, lead)
+                if reply_sent:
+                    mark_reply_sent(sheets, next_id)
 
         mark_as_read(gmail, msg_id)
         save_processed_id(msg_id)

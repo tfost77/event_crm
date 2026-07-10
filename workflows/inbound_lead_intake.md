@@ -39,7 +39,9 @@ Cron expression (edit path as needed):
 | Subject Line | Location |
 |---|---|
 | `New form submission for Timonium Form 2` | Timonium |
+| `New form submission for Timonium Form 1` | Timonium |
 | `New form submission for Locust Point Form 2` | Locust Point |
+| `New form submission for Locust Point Form 1` | Locust Point |
 
 Sender: `no-reply-forms@webflow.com`
 
@@ -96,7 +98,7 @@ See `docs/pricing_reference.md` for full tables and formulas.
 
 - **Weeknight** (Tue–Thu): $15 × median guest bracket × 2 hrs
 - **Weekend** (Fri–Sun): $20 × median guest bracket × 2 hrs
-- **Monday / >60 guests**: Flagged as "Custom" — manual pricing required
+- **Monday / ≥60 guests**: Flagged as "Custom" — manual pricing required
 - **4-hour rate**: Weeknight = 2hr × 2 − $100; Weekend adds the Weeknight/Weekend premium
 
 ---
@@ -124,8 +126,13 @@ Reply sending is **off by default**. Set `ENABLE_REPLY_SEND=true` in `.env` when
 - Personalized greeting with customer's first name
 - Event date, guest count, duration, and estimated 2-hour price
 - Custom pricing note if the event falls on Monday or has >60 guests
-- Location-specific PDF attached (`docs/Customer Pricing - Locust Point.pdf` or `docs/Customer Pricing - TIMONIUM.pdf`)
+- Location-specific PDF attached (`docs/Reservation Pricing - Locust Point.pdf` or `docs/Reservation Pricing - TIMONIUM.pdf`)
 - Sent from `reservations@diamondbackbeer.com`
+
+### Follow-up email (5 business days after initial reply)
+- Sent only if: Reply Sent is set, Follow-up Sent is blank, customer has **not** replied to `reservations@`, and 5 business days have elapsed
+- Includes the same location-appropriate pricing PDF attachment
+- If the customer has already replied, the follow-up is suppressed entirely
 
 ### Calendar conflict check
 Before composing the reply, the script checks the location's Google Calendar for any existing events on the requested date:
@@ -223,7 +230,9 @@ Downstream effects of a blank field:
 ## Known Constraints
 - Webflow field names `Field 5`, `Field 6`, `Field 7` are fragile — if the form is updated, update the parser
 - Monday pricing is not defined in the rate sheet; those leads are flagged Custom
-- Parties >60 require manual custom pricing
+- Parties ≥60 require manual custom pricing (60 on the dot is a buyout)
+- Attendance may be submitted as a range (e.g. "70-90") — the script uses the lower bound for routing, so a range like "70-90" correctly routes to the private buyout template
+- End time (Field 7) is customer-entered and prone to AM/PM errors (e.g. `08:30` instead of `20:30`) — verify during follow-up if duration looks implausible
 - Calendar conflict check uses Eastern time (UTC-5) bounds — events will be correctly captured in ET, but DST offset is fixed at -05:00
 
 ---
@@ -233,10 +242,8 @@ Downstream effects of a blank field:
 |---|---|
 | `tools/run_lead_intake.py` | Full pipeline script |
 | `docs/pricing_reference.md` | Internal pricing tables and logic |
-| `docs/Reservation Pricing - Locust Point.pdf` | Internal source PDF (Locust Point) |
-| `docs/Reservation Pricing - TIMONIUM.pdf` | Internal source PDF (Timonium) |
-| `docs/Customer Pricing - Locust Point.pdf` | Customer-facing PDF attached to replies |
-| `docs/Customer Pricing - TIMONIUM.pdf` | Customer-facing PDF attached to replies |
+| `docs/Reservation Pricing - Locust Point.pdf` | Pricing PDF (Locust Point) — attached to replies |
+| `docs/Reservation Pricing - TIMONIUM.pdf` | Pricing PDF (Timonium) — attached to replies |
 | `.tmp/processed_emails.json` | State file — processed Gmail message IDs |
 | `.tmp/lead_intake.log` | Cron log output |
 | `templates/lp_standard.txt` | Reply template — Locust Point, standard inquiry |
