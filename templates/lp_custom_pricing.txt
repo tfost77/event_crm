@@ -4,7 +4,7 @@ Hi [FIRST_NAME],
 
 Thank you so much for reaching out!
 
-We received your inquiry for [EVENT_DATE] ([DAY_OF_WEEK]) with approximately [GUEST_COUNT] guests.
+We received your inquiry for [EVENT_DATE] ([DAY_OF_WEEK]) from [START_TIME] to [END_TIME] with approximately [GUEST_COUNT] guests.
 
 It looks like your requested date or time falls outside of our normal hours of operation, so we want to make sure we put together the right plan for your group before providing a quote.
 

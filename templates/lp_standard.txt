@@ -6,7 +6,7 @@ Hi [FIRST_NAME],
 Thank you so much for reaching out!
 
 
-We received your inquiry for [EVENT_DATE] ([DAY_OF_WEEK]) with approximately [GUEST_COUNT].
+We received your inquiry for [EVENT_DATE] ([DAY_OF_WEEK]) from [START_TIME] to [END_TIME] with approximately [GUEST_COUNT] guests.
 
 
 We appreciate you thinking of Diamondback for your event. I have attached our overall pricing sheet for your reference. We are able to reserve seating for your group and provide food and drink, all included in the outlined fees.

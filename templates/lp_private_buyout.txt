@@ -2,7 +2,7 @@ SUBJECT: Re: Your Private Event Inquiry — [EVENT_DATE] — Diamondback Brewing
 ---
 Hi [FIRST_NAME],
 
-Thank you so much for reaching out! We appreciate you thinking of Diamondback for your event. I have attached our overall pricing sheet for your reference. We are able to reserve seating for your group and provide food and drink, all included in the outlined fees.
+Thank you so much for reaching out! We received your inquiry for [EVENT_DATE] ([DAY_OF_WEEK]) from [START_TIME] to [END_TIME] with approximately [GUEST_COUNT] guests, and we appreciate you thinking of Diamondback for your event. I have attached our overall pricing sheet for your reference. We are able to reserve seating for your group and provide food and drink, all included in the outlined fees.
 
 For parties greater than 60 guests, we would be closed to the public and would only provide service for the reserved party. Pricing for this style of reservation amounts to a $750 Base Fee for shutting down the full taproom, as well as a $20 per guest, per hour fee would cover UNLIMITED drinks, UNLIMITED pizza, and 20% gratuity for our staff. Depending on the size of your party, we may only be able to accommodate specific hours for your reservation, but that can be discussed on a case-by-case basis.
 
