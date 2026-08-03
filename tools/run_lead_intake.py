@@ -427,13 +427,29 @@ def get_next_lead_id(sheets):
     return len(rows)  # header row + N leads → next ID = N
 
 def get_existing_message_ids(sheets):
-    """Read the Gmail Message ID column (V) to avoid duplicates."""
+    """Map Gmail Message ID -> {lead_id, reply_sent} for dedup and crash recovery.
+
+    Reads Lead ID (col A), Message ID (col V), and Reply Sent (col W) so the
+    caller can tell an already-replied duplicate from a row that was written
+    but never got its reply (e.g. a crash between append_lead and send_reply).
+    """
     result = sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"{CRM_TAB}!V:V",  # Column V = Gmail Message ID
+        range=f"{CRM_TAB}!A:W",
     ).execute()
     rows = result.get("values", [])
-    return {row[0] for row in rows[1:] if row}  # skip header
+    existing = {}
+    for row in rows[1:]:  # skip header
+        msg_id = row[21] if len(row) > 21 else ""  # col V
+        if not msg_id:
+            continue
+        try:
+            lead_id = int(str(row[0]).strip())  # col A
+        except (ValueError, TypeError, IndexError):
+            lead_id = None
+        reply_sent = bool(row[22].strip()) if len(row) > 22 and row[22] else False  # col W
+        existing[msg_id] = {"lead_id": lead_id, "reply_sent": reply_sent}
+    return existing
 
 def append_lead(sheets, lead, lead_id):
     """Append a single lead row to the CRM sheet."""
@@ -870,7 +886,7 @@ def main():
     send_creds = get_send_credentials() if ENABLE_REPLY_SEND else None
 
     ensure_crm_tab(sheets)
-    existing_msg_ids = get_existing_message_ids(sheets)
+    existing_rows = get_existing_message_ids(sheets)
 
     new_emails = fetch_new_lead_emails(gmail)
 
@@ -880,8 +896,26 @@ def main():
         msg_id  = item["id"]
         message = item["message"]
 
-        if msg_id in existing_msg_ids:
-            print(f"  Skipping duplicate: {msg_id}")
+        if msg_id in existing_rows:
+            # Row already exists in the sheet. Normally a true duplicate, but it can
+            # also be a lead whose row was written on a prior run that then crashed
+            # before sending the reply (append_lead succeeds server-side even if the
+            # client times out). In that case Reply Sent is blank — send it now so
+            # the lead isn't silently dropped.
+            info = existing_rows[msg_id]
+            if (ENABLE_REPLY_SEND and not info["reply_sent"]
+                    and info["lead_id"] is not None):
+                lead = parse_lead(msg_id, message)
+                if not lead.get("event_date_raw"):
+                    print(f"  Duplicate {msg_id} has no event date — skipping reply.")
+                else:
+                    print(f"  Duplicate {msg_id} (lead #{info['lead_id']}) has no reply "
+                          f"on record — sending now (crash recovery).")
+                    reply_sent = send_reply(creds, send_creds, lead)
+                    if reply_sent:
+                        mark_reply_sent(sheets, info["lead_id"])
+            else:
+                print(f"  Skipping duplicate: {msg_id}")
             mark_as_read(gmail, msg_id)
             save_processed_id(msg_id)
             continue
